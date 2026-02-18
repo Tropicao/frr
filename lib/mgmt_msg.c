@@ -28,6 +28,15 @@
 #define MGMT_MSG_ERR(ms, fmt, ...)                                             \
 	zlog_err("%s: %s: " fmt, (ms)->idtag, __func__, ##__VA_ARGS__)
 
+/*
+ * Round up message length to 8-byte boundary. When multiple messages are
+ * packed into a stream buffer, this ensures each message starts at an
+ * 8-byte aligned offset. Native message structs contain uint64_t fields
+ * that require proper alignment; on strict-alignment architectures (e.g.,
+ * ARM with NEON), unaligned access to these fields causes SIGBUS.
+ */
+#define MGMT_MSG_ALIGN(len) (((len) + 7) & ~(size_t)7)
+
 DEFINE_MTYPE(LIB, MSG_CONN, "msg connection state");
 
 /**
@@ -88,17 +97,20 @@ enum mgmt_msg_rsched mgmt_msg_read(struct mgmt_msg_state *ms, int fd,
 	assert(stream_get_getp(ms->ins) == 0);
 	left = stream_get_endp(ms->ins);
 	while (left > (ssize_t)sizeof(struct mgmt_msg_hdr)) {
+		size_t aligned_len;
+
 		mhdr = (struct mgmt_msg_hdr *)(STREAM_DATA(ms->ins) + total);
 		if (!MGMT_MSG_IS_MARKER(mhdr->marker)) {
 			MGMT_MSG_DBG(dbgtag, "recv corrupt buffer, disconnect");
 			return MSR_DISCONNECT;
 		}
-		if ((ssize_t)mhdr->len > left)
+		aligned_len = MGMT_MSG_ALIGN(mhdr->len);
+		if ((ssize_t)aligned_len > left)
 			break;
 
 		MGMT_MSG_DBG(dbgtag, "read full message len %u", mhdr->len);
-		total += mhdr->len;
-		left -= mhdr->len;
+		total += aligned_len;
+		left -= aligned_len;
 		mcount++;
 	}
 
@@ -179,7 +191,7 @@ bool mgmt_msg_procbufs(struct mgmt_msg_state *ms,
 		MGMT_MSG_DBG(dbgtag, "Processing stream of len %zu", left);
 
 		for (; left > sizeof(struct mgmt_msg_hdr);
-		     left -= mhdr->len, data += mhdr->len) {
+		     left -= MGMT_MSG_ALIGN(mhdr->len), data += MGMT_MSG_ALIGN(mhdr->len)) {
 			mhdr = (struct mgmt_msg_hdr *)data;
 
 			assert(MGMT_MSG_IS_MARKER(mhdr->marker));
@@ -315,6 +327,7 @@ int mgmt_msg_send_msg(struct mgmt_msg_state *ms, uint8_t version, void *msg,
 	uint8_t *dstbuf;
 	size_t endp, n;
 	size_t mlen = len + sizeof(*mhdr);
+	size_t aligned_mlen = MGMT_MSG_ALIGN(mlen);
 
 	if (mlen > ms->max_msg_sz)
 		MGMT_MSG_DBG(dbgtag, "Sending large msg size %zu > max size %zu",
@@ -322,20 +335,20 @@ int mgmt_msg_send_msg(struct mgmt_msg_state *ms, uint8_t version, void *msg,
 
 	if (!ms->outs) {
 		MGMT_MSG_DBG(dbgtag, "creating new stream for msg len %zu", mlen);
-		ms->outs = stream_new(MAX(ms->max_msg_sz, mlen));
+		ms->outs = stream_new(MAX(ms->max_msg_sz, aligned_mlen));
 	} else if (mlen > ms->max_msg_sz && ms->outs->endp == 0) {
 		/* msg is larger than stream max size get a fit-to-size stream */
 		MGMT_MSG_DBG(dbgtag,
 			     "replacing old stream with fit-to-size for msg len %zu",
 			     mlen);
 		stream_free(ms->outs);
-		ms->outs = stream_new(mlen);
-	} else if (STREAM_WRITEABLE(ms->outs) < mlen) {
+		ms->outs = stream_new(aligned_mlen);
+	} else if (STREAM_WRITEABLE(ms->outs) < aligned_mlen) {
 		MGMT_MSG_DBG(dbgtag,
 			     "enq existing stream len %zu and creating new stream for msg len %zu",
 			     STREAM_WRITEABLE(ms->outs), mlen);
 		stream_fifo_push(&ms->outq, ms->outs);
-		ms->outs = stream_new(MAX(ms->max_msg_sz, mlen));
+		ms->outs = stream_new(MAX(ms->max_msg_sz, aligned_mlen));
 	} else {
 		MGMT_MSG_DBG(
 			dbgtag,
@@ -367,7 +380,9 @@ int mgmt_msg_send_msg(struct mgmt_msg_state *ms, uint8_t version, void *msg,
 		memcpy(dstbuf, msg, len);
 		n = len;
 	}
-	stream_set_endp(s, endp + n);
+	if (n < aligned_mlen - sizeof(*mhdr))
+		memset(dstbuf + n, 0, aligned_mlen - sizeof(*mhdr) - n);
+	stream_set_endp(s, endp + aligned_mlen - sizeof(*mhdr));
 	ms->ntxm++;
 
 	return 0;
